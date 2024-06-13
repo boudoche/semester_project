@@ -178,9 +178,24 @@ class BaseDataset(Dataset):
 
     @staticmethod
     def data_proximal_edges(map_infos, lane_ids=[]):
-        prox= {}
+        """
+        Extracts the proximal left and right boundaries of the specified lane IDs from the given map_infos.
+
+        Args:
+            map_infos (dict): A dictionary containing information about the map.
+            lane_ids (list): A list of lane IDs to extract the proximal edges for. If empty, all lanes will be considered.
+
+        Returns:
+            dict: A dictionary containing the proximal left and right boundaries for the specified lane IDs.
+                  The keys are the lane IDs and the values are dictionaries with 'proximal_left' and 'proximal_right' keys.
+        """
+        # Initialize the proximal edges dictionary
+        prox = {}
+        # Loop through the lane IDs
         for k in map_infos['lane']:
+            # Check if the lane ID is in the lane IDs or if the lane IDs are empty
             if k['id'] in lane_ids:
+                # Get the proximal left and right boundaries
                 prox_info = {}
                 prox_info['proximal_left'] = k.get('left_boundary', None)
                 prox_info['proximal_right'] = k.get('right_boundary', None)
@@ -245,162 +260,137 @@ class BaseDataset(Dataset):
                 result = closest_point
 
             return obj_trajs, result
-    
-# min number of points in ref path should be equal to 120, so we fix MAX_LEN = 12
-    MAX_LEN = 12
 
-        # number of time_steps should be equal to 60, so we fix T = 6 here
-    T = 6
+    @staticmethod
+    def get_proximal_edges(map_polylines, map_polylines_mask, succesor_lane_ids, lane_ids=[], dist_thresh=4.0):
+        """
+        Calculate the proximal edges for a given set of lanes.
 
-    def occupancy_adpter(predictions, scores, neighbors, ref_path):
+        Args:
+            map_polylines (list): A list of polylines representing the map.
+            map_polylines_mask (list): A list of masks for the map polylines.
+            succesor_lane_ids (dict): A dictionary containing the successor and predecessor lane IDs for each lane.
+            lane_ids (list, optional): A list of lane IDs to consider. If empty, all lanes will be considered. Defaults to [].
+            dist_thresh (float, optional): The distance threshold for determining proximal edges. Defaults to 4.0.
+
+        Returns:
+            dict: A dictionary containing the proximal edges for each lane.
 
         """
-            predictions: (nb_vehicles, possible_modes, nb_time_steps=60, nb_attributes) w/ first two attributes x and y coords
-            scores: (nb_vehicles, possible_modes)
-            neighbors: (nb_neighbors, nb_attributes=8)
-            ref_path: (path_len=nb_points, nb_attributes=2) 
+        # Initialize the proximal edges dictionary
+        prox = {}
+        # Loop through the lane IDs
+        for lane_idx in lane_ids:
+            # Get the polyline for the current lane
+            k_mask = map_polylines_mask[0][lane_idx]
+            k = map_polylines[0][lane_idx][k_mask]
+            prox_info = {}
+            prox_info['proximal_left'] = []
+            prox_info['proximal_right'] = []
+            # Loop through the other lanes
+            for idx, s in enumerate(map_polylines[0]):
+                # Check if the lane ID is not in the successor lane IDs and the predecessor lane IDs and check type of lane
+                if idx not in succesor_lane_ids[str(lane_idx)].get('successor', []) and idx not in succesor_lane_ids[str(lane_idx)].get('predecessor', []) and idx != lane_idx and s[0, 9:14].sum() == 1:
+                    # Get the polyline for the other lane
+                    s_mask = map_polylines_mask[0][idx]
+                    s = s[s_mask]
+                    # Calculate the distance between the two polylines
+                    dist = cdist(s[:, :2], k[:, :2])
+                    # Get the minimum distance and the index of the minimum distance
+                    min_dist = np.min(dist)
+                    min_dist_index = np.argmin(dist)
+                    min_dist_index = np.unravel_index(min_dist_index, dist.shape)
+                    # Check if the minimum distance is less than the distance threshold
+                    if min_dist < dist_thresh:
+                        if min_dist_index[0] == 0:
+                            min_dist_index = (min_dist_index[0] + 1, min_dist_index[1])
+                        yaw_s = np.arctan2(s[min_dist_index[0], 4], s[min_dist_index[0], 3])
+                        if min_dist_index[1] == 0:
+                            min_dist_index = (min_dist_index[0], min_dist_index[1] + 1)
+                        yaw_k = np.arctan2(k[min_dist_index[1], 4], k[min_dist_index[1], 3])
+                        # Check if the yaw of the two polylines is close to 90 degrees
+                        if np.isclose(yaw_s, yaw_k, atol=(np.pi / 2)):
+                            if yaw_s - yaw_k > 0:
+                                prox_info['proximal_left'].append(idx)
+                            else:
+                                prox_info['proximal_right'].append(idx)
+            # Add the proximal edges to the proximal edges dictionary
+
+            prox[str(lane_idx)] = prox_info
+
+        return prox
+    
+
+    
+    
+    @staticmethod
+    def get_data_succesor_edges(map_infos, lane_ids=[]):
         """
+        Get the successor and predecessor edges for the given lane IDs.
 
-        # determines index of the most probable mode for each vehicle's predicted trajectory : 1D array of shape (nb_vehicles,)
-        # best_mode = np.argmax(scores.cpu().numpy(), axis=-1)
-        best_mode = np.argmax(scores, axis=-1)
-            
-        # predictions = predictions.cpu().numpy()
-        #neighbors = neighbors.cpu().numpy()
-    
-        # extracts the best (most probable) trajectory for each vehicle
-        best_predictions = [predictions[i, best_mode[i], :, :2] for i in range(predictions.shape[0])]
-        # best_predictions is a list where each element is a 2D array representing the x and y coordinates of the best
-        # trajectory for a specific vehicle across all time steps.
-            
-        # converts each best trajectory from Cartesian coordinates to the Frenet coordinate system relative to the ref path
-        prediction_F = [transform_to_Frenet(a, ref_path) for a in best_predictions]
-        # prediction_F is a list where each element contains the Frenet coordinates (s and l, and optionally heading h)
-        # for each best trajectory.
+        Args:
+            map_infos (dict): A dictionary containing information about the map.
+            lane_ids (list): A list of lane IDs to filter the results. If empty, all lanes will be considered.
 
-        len_path = ref_path.shape[0] # length of the reference path
-        if len_path < MAX_LEN * 10:
-                # if the ref path is shorter than the minimum path length, we extend it by repeating the last point
-            ref_path = np.append(ref_path, np.repeat(ref_path[np.newaxis, -1], MAX_LEN*10 -len(ref_path), axis=0), axis=0)
-    
-        time_occupancy = np.stack(T * 10 * [ref_path[:, -1]], axis=0) # (timestep, path_len)
-
-        # fills the time_occupancy array
-        for t in range(T * 10): # iterates over the time steps 
-            for n, a in enumerate(prediction_F):
-                # Skip if the neighbor is invalid or not considered
-                if neighbors[n][0] == 0: 
-                    continue
-                # Skip if the Frenet `s` coordinate is not positive
-                if a[0][0] <= 0:
-                    continue
-            
-                # Calculate intersection threshold
-                aw = neighbors[n][7]
-                threshold = aw * 0.5 + WIDTH * 0.5 + 0.3
-
-                    # Check if Frenet coordinates of vehicle a fall within the threshold
-                if a[t][0] > 0 and np.abs(a[t][1]) < threshold:
-                    al = neighbors[n][6]
-                    backward = 0.5 * al + 3
-                    forward = 0.5 * al
-                    os = np.clip(a[t][0] - backward, 0, MAX_LEN)
-                    oe = np.clip(a[t][0] + forward, 0, MAX_LEN)
-                    time_occupancy[t][int(os*10):int(oe*10)] = 1
-
-                # Extend occupancy if path length is shorter than minimum path length
-            if len_path < MAX_LEN * 10:
-                time_occupancy[t][len_path:] = 1
-
-        time_occupancy = np.reshape(time_occupancy, (T*10, -1, 10))
-        time_occupancy = np.max(time_occupancy, axis=-1)
-
-        return time_occupancy
-
-                
-                
-
- 
-        
-    
-    
-
-    @staticmethod
-    def get_proximal_edges_bis(map_polylines,map_polylines_mask,succesor_lane_ids, lane_ids= [], dist_thresh = 4.0):
-            prox = {}
-            for lane_idx in lane_ids:
-                k_mask = map_polylines_mask[0][lane_idx]
-                k = map_polylines[0][lane_idx][k_mask]
-                prox_info = {}
-                prox_info['proximal_left'] = []
-                prox_info['proximal_right'] = []
-                for idx,s in enumerate(map_polylines[0]):
-                    if idx not in succesor_lane_ids[str(lane_idx)].get('successor',[]) and idx not in succesor_lane_ids[str(lane_idx)].get('predecessor',[]) and idx!=lane_idx and s[0,9:14].sum() == 1  :
-                        s_mask = map_polylines_mask[0][idx]
-                        s = s[s_mask]
-                        dist = cdist(s[:,:2],k[:,:2])
-                        min_dist = np.min(dist)
-                        min_dist_index = np.argmin(dist)
-                        min_dist_index = np.unravel_index(min_dist_index, dist.shape)
-                        if min_dist < dist_thresh:
-                            if min_dist_index[0]==0:
-                                min_dist_index= (min_dist_index[0]+1,min_dist_index[1])
-                            yaw_s= np.arctan2(s[min_dist_index[0],4],s[min_dist_index[0],3])
-                            if min_dist_index[1]==0:
-                                min_dist_index= (min_dist_index[0],min_dist_index[1]+1)
-                            yaw_k= np.arctan2(k[min_dist_index[1],4],k[min_dist_index[1],3])
-                            
-                            #is_left = np.cross([np.cos(yaw_s),np.sin(yaw_s)],[k_dist[min_dist_index[1],0]-s_dist[min_dist_index[0],0],k_dist[min_dist_index[1],1]-s_dist[min_dist_index[0],1]])
-                            if np.isclose(yaw_s,yaw_k,atol=(np.pi/2)):
-                                if yaw_s-yaw_k>0:
-                                    prox_info['proximal_left'].append(idx)
-                                else:  
-                                    prox_info['proximal_right'].append(idx)
-                        
-
-                            
-                    prox[str(lane_idx)] = prox_info
-
-            
-            return prox
-    
-
-    
-    
-    @staticmethod
-    def get_data_succesor_edges(map_infos , lane_ids= []):
-            suc = {}
-            for k in map_infos['lane']:
-                if k['id'] in lane_ids or lane_ids == []:
-                    suc_info = {}
-                    suc_info['successor'] = k.get('exit_lanes', None)
-                    suc_info['predecessor'] = k.get('entry_lanes', None)
-                    suc[k.get('id', None)] = suc_info
-
-            return suc
-    
-    @staticmethod
-    def get_succesor_edges_bis(map_polyines, masks,  lane_idx= []):
-            suc = {}
-            for lane_id in lane_idx:
-                k_mask = masks[0][lane_id]
-                k = map_polyines[0][lane_id][k_mask]
+        Returns:
+            dict: A dictionary containing the successor and predecessor edges for the given lane IDs.
+                  The keys are the lane IDs and the values are dictionaries with 'successor' and 'predecessor' keys.
+        """
+        suc = {}
+        for k in map_infos['lane']:
+            # Check if the lane ID is in the lane IDs or if the lane IDs are empty
+            if k['id'] in lane_ids or lane_ids == []:
+                # Get the successor and predecessor information
                 suc_info = {}
-                suc_info['successor'] = []
-                suc_info['predecessor'] = []
-                for idx,s in enumerate(map_polyines[0]):
-                    if idx!=lane_id :
-                        s_mask = masks[0][idx]
-                        s = s[s_mask]
-                        if s.shape[0] > 0 and k.shape[0] > 0 and s[0,9:14].sum() == 1 :
-                            if np.linalg.norm(s[-1,:2]-k[0,:2]) < 15e-1:
-                                suc_info['predecessor'].append(idx)
-                            if np.linalg.norm(s[0,:2]-k[-1,:2]) < 15e-1:
-                                suc_info['successor'].append(idx)
-                            suc[str(lane_id)] = suc_info
-                
+                suc_info['successor'] = k.get('exit_lanes', None)
+                suc_info['predecessor'] = k.get('entry_lanes', None)
+                suc[k.get('id', None)] = suc_info
 
-            return suc
+        return suc
+    
+    @staticmethod
+    def get_successor_edges(map_polyines, masks, lane_idx=[]):
+        """
+        Get the successor edges for a given lane index.
+
+        Args:
+            map_polyines (list): List of map polylines.
+            masks (list): List of masks.
+            lane_idx (list, optional): List of lane indices. Defaults to [].
+
+        Returns:
+            dict: Dictionary containing the successor edges information.
+                The keys are the lane indices and the values are dictionaries
+                with 'successor' and 'predecessor' lists.
+
+        """
+        # Initialize the successor dictionary
+        suc = {}
+        # Loop through the lane indices
+        for lane_id in lane_idx:
+            # Get the polyline for the current lane
+            k_mask = masks[0][lane_id]
+            k = map_polyines[0][lane_id][k_mask]
+            suc_info = {}
+            suc_info['successor'] = []
+            suc_info['predecessor'] = []
+            # Loop through the other lanes
+            for idx, s in enumerate(map_polyines[0]):
+                # Check if the lane index is not the same as the current lane index
+                if idx != lane_id:
+                    # Get the polyline for the other lane
+                    s_mask = masks[0][idx]
+                    s = s[s_mask]
+                    # Check if the polylines have the same type
+                    if s.shape[0] > 0 and k.shape[0] > 0 and s[0, 9:14].sum() == 1:
+                        # Check if the distance between the polylines is less than 15e-1
+                        if np.linalg.norm(s[-1, :2] - k[0, :2]) < 15e-1:
+                            suc_info['predecessor'].append(idx)
+                        if np.linalg.norm(s[0, :2] - k[-1, :2]) < 15e-1:
+                            suc_info['successor'].append(idx)
+                        suc[str(lane_id)] = suc_info
+
+        return suc
     
 
     
@@ -681,6 +671,24 @@ class BaseDataset(Dataset):
         
 
         def find_closest_segment_index(map_polylines, ego_state):
+            """
+            Finds the closest segment index in a set of map polylines to a given ego state.
+
+            Parameters:
+            - map_polylines (ndarray): A 3D array representing the map polylines.
+            - ego_state (ndarray): A 2D array representing the ego state.
+
+            Returns:
+            - tuple: A tuple containing the closest polyline index and the closest segment index.
+
+            The function iterates through the flattened map polylines and calculates the distance between each non-zero point
+            and the origin (0, 0). It then checks conditions on polyline columns 9 to 13 and selects the polyline with the
+            minimum non-zero distance that satisfies the conditions. The function also compares the line heading and ego heading
+            to determine if they are close enough. Finally, it returns the closest polyline index and the closest segment index.
+            """
+            # Function code here
+            ...
+        def find_closest_segment_index(map_polylines, ego_state):
             flattened_polylines = map_polylines.reshape(-1, map_polylines.shape[-2], map_polylines.shape[-1])
 
             closest_polyline_index = -1
@@ -704,6 +712,7 @@ class BaseDataset(Dataset):
                             closest_segment_index = np.argmin(distances)
                             line_heading = np.arctan2(polyline[closest_segment_index, 4], polyline[closest_segment_index, 3])
                             ego_heading = np.arctan2(ego_state[20,33], ego_state[20,34])
+                            # Check if the line heading and ego heading are close enough
                             if np.isclose(line_heading, ego_heading, atol=np.pi/4):
                                 min_distance = min_non_zero_distance
 
@@ -712,10 +721,13 @@ class BaseDataset(Dataset):
 
 
 
-        
+        # Get closest segment index
         ego_polyline_idx = find_closest_segment_index(ret_dict['map_polylines'], ret_dict['obj_trajs'][0,ret_dict['track_index_to_predict'][0],:,:])
-        ego_connectivity = self.get_succesor_edges_bis(ret_dict['map_polylines'], ret_dict['map_polylines_mask'], lane_idx = [ego_polyline_idx[0]])
-        candidates = self.get_proximal_edges_bis(ret_dict['map_polylines'], ret_dict['map_polylines_mask'], ego_connectivity, lane_ids = [ego_polyline_idx[0]])
+        # Get ego connectivity
+        ego_connectivity = self.get_successor_edges(ret_dict['map_polylines'], ret_dict['map_polylines_mask'], lane_idx = [ego_polyline_idx[0]])
+        # Get proximal edges
+        candidates = self.get_proximal_edges(ret_dict['map_polylines'], ret_dict['map_polylines_mask'], ego_connectivity, lane_ids = [ego_polyline_idx[0]])
+        # Get starting block
         cand_list = []
         for k,v in candidates.items():
             if v['proximal_left'] != []:
@@ -725,89 +737,25 @@ class BaseDataset(Dataset):
                 for l in v['proximal_right']:
                     cand_list.append(l)
         cand_list.append(ego_polyline_idx[0])
-
         starting_block= cand_list
 
+        # get the candidate lanes
         condition = np.sum(ret_dict['map_polylines'][:,:,:,9:14] == 1, axis=-1) > 0
         indices = np.where(condition)
         candidate_ids = np.unique(np.stack(indices[:2], axis=1), axis=0)
-
+        # Init the lattice planner
         planner= st.LatticePlanner(candidate_ids[:,1])
-        
+        # Plan the path
         path = planner.plan(ret_dict['obj_trajs'][0,ret_dict['track_index_to_predict'][0],:,:], starting_block, ret_dict, info['dynamic_map_infos'], info['map_infos'])
 
-       
-        
-
-        fig = plt.figure(dpi=300)
-        x_min, x_max = 0 - 120, 0 + 120
-        y_min, y_max = 0 - 120, 0 + 120
-        plt.xlim(x_min, x_max)
-        plt.ylim(y_min,y_max)
-        plt.axis('off')
-
-
-        i=0
-        for road,mask in zip(ret_dict['map_polylines'][0,:,:,:], ret_dict['map_polylines_mask'][0,:,:]) :
-          
-            if(i==ego_polyline_idx[0]):
-                plt.plot(road[:, 0], road[:, 1], color="red", linewidth=1)
-            elif i in ego_connectivity[str(ego_polyline_idx[0])]['predecessor'] or i in ego_connectivity[str(ego_polyline_idx[0])]['successor']:
-                plt.plot(road[mask, 0], road[mask, 1], color='green', linewidth=1)
-            elif i in candidates[str(ego_polyline_idx[0])].get('proximal_left',[]) or i in candidates[str(ego_polyline_idx[0])].get('proximal_right',[]):
-                plt.plot(road[mask, 0], road[mask, 1], color='gray', linewidth=1)
-            else:
-                plt.plot(road[mask, 0], road[mask, 1],  color='black', linewidth=1)
-            i+=1
-
-        scenario_id= ret_dict['scenario_id'][0]
-        if path is not None:
-            x = path[:,0]
-            y = path[:,1]
-            plt.plot(x, y, color='blue', linewidth=1.5)
-
-        plt.plot(0,0,marker='*',color='brown')
-        
-        plt.savefig(f'/home/omar/MotionNetAO/img/proxi_{scenario_id}.png')
-
-        plt.close(fig)
-
-        fig = plt.figure(dpi=300)
-        x_min, x_max = 0 - 120, 0 + 120
-        y_min, y_max = 0 - 120, 0 + 120
-        plt.xlim(x_min, x_max)
-        plt.ylim(y_min,y_max)
-        plt.axis('off')
-
+        # Get the physics model
         from models.physics_model.physics import PhysicsOracle
 
         physics = PhysicsOracle(6, ret_dict['obj_trajs'][0],ret_dict['center_gt_trajs'][0])
-
         paths= physics()
 
-
-        i=0
-        for road,mask in zip(ret_dict['map_polylines'][0,:,:,:], ret_dict['map_polylines_mask'][0,:,:]) :
-          
-            if(i==ego_polyline_idx[0]):
-                plt.plot(road[:, 0], road[:, 1], color="red", linewidth=1)
-            else:
-                plt.plot(road[mask, 0], road[mask, 1],  color='black', linewidth=1)
-            i+=1
-
-        scenario_id= ret_dict['scenario_id'][0]
         
-        if paths is not None:
-                x = paths[:,0]
-                y = paths[:,1]
-                plt.plot(x, y, color='brown', linewidth=1.5)
-
-        plt.plot(0,0,marker='*',color='brown')
-        
-        plt.savefig(f'/home/omar/MotionNetAO/img/phys_{scenario_id}.png')
-
-        plt.close(fig)
-
+        # Add the path to the return dictionary
         ret_dict['path_lattice'] = np.expand_dims(path,axis=0)
         ret_dict['path_physics'] = np.expand_dims(paths,axis=0)
             
