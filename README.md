@@ -35,9 +35,4 @@ The training process includes a visualization step that generates images of the 
 The State Lattice Path Planner path in pink.
 The Physics Model path in yellow.
 These visualizations will help in qualitatively assessing the performance of different trajectory generation methods.
- 
-2. Clone the repo to RCP server, and modify the config file
-3. Modify the motionnet/run_rcp/train.yaml, especially configs related to file path, username, etc.
-3. Run the following command to train on RCP server
-```kubectl create -f train.yaml```
 
